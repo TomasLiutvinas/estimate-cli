@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+# estimate: back-calculate start time(s) from a target with optional steps and variants
+# - Target forms accepted: "11 30", "11:30", "label 11 30", "label 11:30"
+# - Any label allowed; no special-casing "target"
+# - Positional PLAN or -f/--file for explicit path/"-"
+# - Inline comments (# or ;) supported
+# - Optional steps with leading '?'
+# - Variants over optional steps; human-readable variant names using step labels
+# - Deterministic ordering, summary, safeguards
+# - Shorthands: -v/--variants, -s/--summary-only, -m/--max-variants, -a/--ascii, -j/--json, -d/--date
+
+from __future__ import annotations
+import argparse
+import datetime as dt
+import itertools
+import json
+import pathlib
+import re
+import sys
+import textwrap
+from dataclasses import dataclass
+from typing import Iterable, List, Optional, Sequence, Tuple, Dict
+
+# -------- Samples --------
+SAMPLE_PLAN_MIN = """# Sample plan (use '?' for optional).
+# Target lines supported:
+#   - implicit last line:                `11:30` or `11 30`
+#   - named target (any label):          `arrival 11:30` or `arrival 11 30`
+prep 30m
+? pick up vladis 20m
+? grab food 20m
+drive 1h10m
+park 20m
+meeting 11 30
+"""
+
+SAMPLE_PLAN_VARIANTS = """# Sample plan to try --variants mode (named target)
+prep 30m
+? practice game 60m
+? pick up vladis 20m
+? grab food 20m
+drive 1h10m
+park 20m
+meeting 11 30
+"""
+
+# -------- Regex (precompiled) --------
+CLOCK_TOKEN = r'(\d{1,2})(?::|\s)(\d{2})'
+TIME_ONLY_RE = re.compile(rf'^\s*{CLOCK_TOKEN}\s*$', re.IGNORECASE)
+NAMED_TARGET_RE = re.compile(rf'^(?P<label>[^?].*?)\s+{CLOCK_TOKEN}\s*$', re.IGNORECASE)
+DUR_RE = re.compile(r'(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?$', re.IGNORECASE)
+
+# -------- Data model --------
+@dataclass(frozen=True)
+class Step:
+    idx: int
+    name: str
+    dur: dt.timedelta
+    optional: bool
+
+# -------- Utilities --------
+def die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+def strip_inline_comment(s: str) -> str:
+    for sep in ("#", ";"):
+        if sep in s:
+            s = s.split(sep, 1)[0]
+    return s.strip()
+
+def parse_duration(token: str) -> dt.timedelta:
+    s = token.strip().lower().replace('min', 'm').replace(' ', '')
+    if not s:
+        die(f"Invalid duration: {token!r}")
+    if s.isdigit():
+        return dt.timedelta(minutes=int(s))
+    m = DUR_RE.fullmatch(s)
+    if m and (m.group(1) or m.group(2)):
+        return dt.timedelta(hours=int(m.group(1) or 0), minutes=int(m.group(2) or 0))
+    m = re.fullmatch(r'(\d+)h(\d+)$', s)  # "1h30"
+    if m:
+        return dt.timedelta(hours=int(m.group(1)), minutes=int(m.group(2)))
+    if ':' in s and s.replace(':', '').isdigit():
+        die(f"Invalid duration (looks like a time): {token}. Use 1h30m / 90m.")
+    die(f"Invalid duration: {token}")
+
+def parse_time_text(s: str) -> dt.time:
+    m = TIME_ONLY_RE.fullmatch(s.strip())
+    if not m:
+        die(f"Invalid target time: {s}")
+    hh, mm = int(m.group(1)), int(m.group(2))
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        die(f"Invalid clock: {hh:02d}:{mm:02d}")
+    return dt.time(hh, mm)
+
+def load_plan(selector: str) -> Tuple[str, str]:
+    if selector == "-":
+        return sys.stdin.read(), "(stdin)"
+    p = pathlib.Path(selector).expanduser()
+    if p.exists():
+        return p.read_text(encoding="utf-8"), str(p)
+    cwd = pathlib.Path.cwd()
+    for cand in (cwd / selector, cwd / f"{selector}.plan", cwd / f"{selector}.txt"):
+        if cand.exists():
+            return cand.read_text(encoding="utf-8"), str(cand)
+    die(f"Plan not found: {selector}")
+
+def parse_date(s: str) -> dt.date:
+    try:
+        return dt.datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        raise argparse.ArgumentTypeError("Use YYYY-MM-DD")
+
+# -------- Parsing plan --------
+def parse_plan(text: str) -> Tuple[List[Step], Optional[dt.time], str]:
+    raw = [strip_inline_comment(ln) for ln in text.splitlines()]
+    lines = [ln for ln in raw if ln]
+    steps: List[Step] = []
+    target_time: Optional[dt.time] = None
+    target_label = "TARGET"
+    consumed: set[int] = set()
+
+    # Named target anywhere: "<label> HH:MM" or "<label> HH MM"
+    for i, ln in enumerate(lines):
+        m = NAMED_TARGET_RE.fullmatch(ln)
+        if m:
+            if target_time is not None:
+                die("Multiple targets found. Keep only one target line.")
+            target_time = parse_time_text(m.group(2) + ":" + m.group(3))
+            target_label = m.group('label').strip() or "TARGET"
+            consumed.add(i)
+
+    # Implicit last line time if none yet
+    if target_time is None and lines:
+        last_i = len(lines) - 1
+        m = TIME_ONLY_RE.fullmatch(lines[last_i])
+        if m:
+            target_time = parse_time_text(lines[last_i])
+            consumed.add(last_i)
+
+    # Remaining lines become steps
+    for i, ln in enumerate(lines):
+        if i in consumed:
+            continue
+        if TIME_ONLY_RE.fullmatch(ln):
+            die(f"Ambiguous time line (not used as target): {ln}")
+        optional = ln.startswith("?")
+        body = ln[1:].lstrip() if optional else ln
+        tokens = body.split()
+        if not tokens:
+            die(f"Empty step line near: {ln}")
+        split = next((j for j, t in enumerate(tokens) if any(c.isdigit() for c in t)), None)
+        if split is None:
+            die(f"Missing duration: {ln}")
+        name = " ".join(tokens[:split]).strip()
+        if not name:
+            die(f"Missing step name: {ln}")
+        dur = parse_duration("".join(tokens[split:]))
+        steps.append(Step(idx=len(steps), name=name, dur=dur, optional=optional))
+
+    if not steps:
+        die("No steps found")
+    if all(s.optional for s in steps):
+        die("All steps are optional; add a non-optional step for a baseline plan.")
+    return steps, target_time, target_label
+
+# -------- Scheduling --------
+def build_timeline(steps: Sequence[Step], target: Optional[dt.datetime], include_idxs: set[int]):
+    cursor = target
+    out = []
+    for st in reversed(steps):
+        if st.optional and st.idx not in include_idxs:
+            continue
+        start = cursor - st.dur if cursor is not None else None
+        out.append((st.idx, st.name, start, st.dur))
+        if cursor is not None:
+            cursor = start
+    out.reverse()
+    begin = out[0][2] if out and out[0][2] is not None else None
+    total_min = sum(int(d.total_seconds() // 60) for (_i, _n, _s, d) in out)
+    return out, begin, dt.timedelta(minutes=total_min)
+
+# -------- Formatting --------
+def fmt_clock(dt_or_none: Optional[dt.datetime], dash: str) -> str:
+    return dt_or_none.strftime("%H:%M") if dt_or_none else dash
+
+def fmt_dur(td: dt.timedelta) -> str:
+    m = int(td.total_seconds() // 60)
+    return f"{m//60}h{m%60:02d}m" if m >= 60 else f"{m}m"
+
+def tabulate(rows: List[List[str]]) -> str:
+    colw = [max(len(str(c)) for c in col) for col in zip(*rows)] if rows else []
+    def line(cols): return "  ".join(str(c).ljust(w) for c, w in zip(cols, colw))
+    return "\n".join(line(r) for r in rows)
+
+def variant_key(idx_set: set[int]) -> Tuple[int, List[int]]:
+    return (len(idx_set), sorted(idx_set))
+
+def build_optional_display_labels(steps: Sequence[Step]) -> Dict[int, str]:
+    """Return disambiguated labels for optional steps. If duplicate names exist,
+    append ' (2)', ' (3)', ... by occurrence order."""
+    optionals = [s for s in steps if s.optional]
+    name_counts: Dict[str, int] = {}
+    labels: Dict[int, str] = {}
+    for st in optionals:
+        name_counts[st.name] = name_counts.get(st.name, 0) + 1
+        count = name_counts[st.name]
+        labels[st.idx] = f"{st.name} ({count})" if count > 1 else st.name
+    return labels
+
+def variant_name(include_idxs: set[int], opt_labels: Dict[int, str]) -> str:
+    if not include_idxs:
+        return "base"
+    ordered = [i for i in sorted(include_idxs)]
+    parts = [opt_labels.get(i, f"#{i}") for i in ordered]
+    return " + ".join(parts)
+
+# -------- CLI --------
+def main() -> None:
+    examples = textwrap.dedent("""
+      Examples:
+        estimate --sample
+        estimate --sample-variants
+        estimate today
+        estimate trip.plan
+        cat my.plan | estimate -f -
+        estimate today -v -s
+    """).strip()
+
+    ap = argparse.ArgumentParser(
+        prog="estimate",
+        description="Back-calculate start time from a target (if present). Supports optional steps and variant generation.",
+        epilog=examples,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("plan", nargs="?", help="Plan name/basename in CWD (loads NAME, NAME.plan, or NAME.txt).")
+    ap.add_argument("-f", "--file", help="Explicit file path or '-' for stdin.")
+    ap.add_argument("-d", "--date", type=parse_date, help="Calendar date for target (YYYY-MM-DD). Default: today.")
+    ap.add_argument("-v", "--variants", action="store_true", help="Generate all subsets of optional steps.")
+    ap.add_argument("-s", "--summary-only", action="store_true", help="With -v/--variants, print only the final summary.")
+    ap.add_argument("-m", "--max-variants", type=int, default=1000, help="Maximum allowed variant count. Default: 1000.")
+    ap.add_argument("-a", "--ascii", action="store_true", help="Use '-' instead of '—' for missing times.")
+    ap.add_argument("-j", "--json", action="store_true", help="Emit machine-readable JSON.")
+    ap.add_argument("--sample", action="store_true", help="Print a minimal sample plan and exit.")
+    ap.add_argument("--sample-variants", action="store_true", help="Print a sample plan with multiple optionals and exit.")
+
+    args = ap.parse_args()
+
+    if args.sample:
+        print(SAMPLE_PLAN_MIN, end="")
+        return
+    if args.sample_variants:
+        print(SAMPLE_PLAN_VARIANTS, end="")
+        return
+
+    selector = args.file or args.plan
+    if not selector:
+        ap.print_help()
+        sys.exit(2)
+
+    text, origin = load_plan(selector)
+    steps, tgt, tgt_label = parse_plan(text)
+    target_dt = dt.datetime.combine(args.date or dt.date.today(), tgt) if tgt else None
+
+    dash = "-" if args.ascii else "—"
+    optionals = [s for s in steps if s.optional]
+    opt_labels = build_optional_display_labels(steps)
+
+    # Variants mode
+    if args.variants:
+        opt_count = len(optionals)
+        total_variants = 1 << opt_count
+        if total_variants > args.max_variants:
+            die(f"Too many variants ({total_variants}). Use -m/--max-variants or reduce optionals.")
+        opt_indices = [s.idx for s in optionals]
+        combos: List[set[int]] = [set()]
+        for r in range(1, opt_count + 1):
+            for combo in itertools.combinations(opt_indices, r):
+                combos.append(set(combo))
+        combos.sort(key=variant_key)
+
+        summary = []
+        if not args.summary_only:
+            print(f"Source: {origin}\n")
+
+        for include in combos:
+            tl, begin, total = build_timeline(steps, target_dt, include)
+            vname = variant_name(include, opt_labels)
+            summary.append((vname, begin, total))
+            if args.summary_only:
+                continue
+            print(f"Variant: {vname}")
+            if target_dt:
+                print(f"Begin: {fmt_clock(begin, dash)}")
+                for _idx, nm, start, dur in tl:
+                    print(f"{fmt_clock(start, dash)} ({fmt_dur(dur)}) {nm}")
+                print(f"{fmt_clock(target_dt, dash)} {tgt_label}")
+            else:
+                print(f"Total: {fmt_dur(total)}")
+                for _idx, nm, _start, dur in tl:
+                    print(f"({fmt_dur(dur)}) {nm}")
+            print("------------------------------------------------")
+
+        if args.json:
+            payload = {
+                "source": origin,
+                "target": {"label": tgt_label, "time": target_dt.strftime("%H:%M")} if target_dt else None,
+                "variants": [
+                    {
+                        "name": n,
+                        "begin": b.strftime("%H:%M") if b else None,
+                        "total_min": int(t.total_seconds() // 60),
+                    }
+                    for (n, b, t) in summary
+                ],
+            }
+            print(json.dumps(payload, indent=2))
+            return
+
+        if target_dt:
+            print("Variant starts:")
+            w = max(len(n) for (n, _b, _t) in summary) if summary else 0
+            for (n, b, _t) in summary:
+                print(f"  {n.ljust(w)}  {fmt_clock(b, dash)}")
+        else:
+            print("Variant totals:")
+            w = max(len(n) for (n, _b, _t) in summary) if summary else 0
+            for (n, _b, t) in summary:
+                print(f"  {n.ljust(w)}  {fmt_dur(t)}")
+        return
+
+    # Default: comparison table (All vs Core)
+    include_all = {s.idx for s in optionals}
+    tl_all, begin_all, total_all = build_timeline(steps, target_dt, include_all)
+    tl_core, begin_core, total_core = build_timeline(steps, target_dt, set())
+
+    time_by_idx_all = {i: start for (i, _n, start, _d) in tl_all}
+    time_by_idx_core = {i: start for (i, _n, start, _d) in tl_core}
+
+    rows = [["Step", "Dur", "All", "Core"], ["----", "---", "---", "----"]]
+    for st in steps:
+        a_time = time_by_idx_all.get(st.idx)
+        c_time = time_by_idx_core.get(st.idx) if target_dt else None
+        rows.append([
+            st.name + (" *" if st.optional else ""),
+            fmt_dur(st.dur),
+            fmt_clock(a_time, dash) if target_dt else dash,
+            fmt_clock(c_time, dash) if target_dt else dash,
+        ])
+    rows.append(["", "", "", ""])
+    if target_dt:
+        rows += [
+            [f"Begin at (All) → {tgt_label}", "", "", fmt_clock(begin_all, dash)],
+            [f"Begin at (Core) → {tgt_label}", "", "", fmt_clock(begin_core, dash)],
+            [tgt_label, "", "", fmt_clock(target_dt, dash)],
+        ]
+    else:
+        rows += [
+            ["Total (All)", "", "", fmt_dur(total_all)],
+            ["Total (Core)", "", "", fmt_dur(total_core)],
+            [tgt_label, "", "", dash],
+        ]
+
+    if args.json:
+        payload = {
+            "source": origin,
+            "target": {"label": tgt_label, "time": target_dt.strftime("%H:%M")} if target_dt else None,
+            "rows": rows,
+        }
+        print(json.dumps(payload, indent=2))
+        return
+
+    print(f"Source: {origin}")
+    print(tabulate(rows))
+
+if __name__ == "__main__":
+    main()
