@@ -31,7 +31,7 @@ prep 30m
 ? grab food 20m
 drive 1h10m
 park 20m
-meeting 11 30
+arrival 11 30
 ```
 
 (assuming you got `today.plan` or `today.txt` at workingdir)
@@ -51,9 +51,9 @@ grab food *                20m    09:40  —
 drive                      1h10m  10:00  10:00
 park                       20m    11:10  11:10
 
-Begin at (All) → meeting                 08:50
-Begin at (Core) → meeting                09:30
-meeting                                  11:30
+Begin at (All) → arrival                 08:50
+Begin at (Core) → arrival                09:30
+arrival                                  11:30
 ```
 
 ## Only summary of all possible options
@@ -82,7 +82,7 @@ Begin: 09:30
 09:30 (30m) prep
 10:00 (1h10m) drive
 11:10 (20m) park
-11:30 meeting
+11:30 arrival
 ------------------------------------------------
 Variant: pick up vladis
 Begin: 09:10
@@ -90,7 +90,7 @@ Begin: 09:10
 09:40 (20m) pick up vladis
 10:00 (1h10m) drive
 11:10 (20m) park
-11:30 meeting
+11:30 arrival
 ------------------------------------------------
 Variant: grab food
 Begin: 09:10
@@ -98,7 +98,7 @@ Begin: 09:10
 09:40 (20m) grab food
 10:00 (1h10m) drive
 11:10 (20m) park
-11:30 meeting
+11:30 arrival
 ------------------------------------------------
 Variant: pick up vladis + grab food
 Begin: 08:50
@@ -107,7 +107,7 @@ Begin: 08:50
 09:40 (20m) grab food
 10:00 (1h10m) drive
 11:10 (20m) park
-11:30 meeting
+11:30 arrival
 ------------------------------------------------
 Variant starts:
   base                        09:30
