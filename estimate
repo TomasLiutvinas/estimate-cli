@@ -338,29 +338,62 @@ def main() -> None:
     time_by_idx_all = {i: start for (i, _n, start, _d) in tl_all}
     time_by_idx_core = {i: start for (i, _n, start, _d) in tl_core}
 
-    rows = [["Step", "Dur", "All", "Core"], ["----", "---", "---", "----"]]
-    for st in steps:
-        a_time = time_by_idx_all.get(st.idx)
-        c_time = time_by_idx_core.get(st.idx) if target_dt else None
-        rows.append([
-            st.name + (" *" if st.optional else ""),
-            fmt_dur(st.dur),
-            fmt_clock(a_time, dash) if target_dt else dash,
-            fmt_clock(c_time, dash) if target_dt else dash,
-        ])
-    rows.append(["", "", "", ""])
-    if target_dt:
-        rows += [
-            [f"Begin at (All) → {tgt_label}", "", "", fmt_clock(begin_all, dash)],
-            [f"Begin at (Core) → {tgt_label}", "", "", fmt_clock(begin_core, dash)],
-            [tgt_label, "", "", fmt_clock(target_dt, dash)],
-        ]
+    # If there is a target and All/Core schedules are identical, collapse them
+    schedules_match = (
+        target_dt is not None
+        and begin_all == begin_core
+        and all(
+            time_by_idx_all.get(st.idx) == time_by_idx_core.get(st.idx)
+            for st in steps
+        )
+    )
+
+    if schedules_match:
+        # Single-schedule view
+        rows = [["Step", "Dur", "Time"], ["----", "---", "----"]]
+        for st in steps:
+            t = time_by_idx_all.get(st.idx)
+            rows.append([
+                st.name + (" *" if st.optional else ""),
+                fmt_dur(st.dur),
+                fmt_clock(t, dash) if target_dt else dash,
+            ])
+        rows.append(["", "", ""])
+        if target_dt:
+            rows += [
+                [f"Begin → {tgt_label}", "", fmt_clock(begin_all, dash)],
+                [tgt_label, "", fmt_clock(target_dt, dash)],
+            ]
+        else:
+            rows += [
+                ["Total", "", fmt_dur(total_all)],
+                [tgt_label, "", dash],
+            ]
     else:
-        rows += [
-            ["Total (All)", "", "", fmt_dur(total_all)],
-            ["Total (Core)", "", "", fmt_dur(total_core)],
-            [tgt_label, "", "", dash],
-        ]
+        # Full All vs Core comparison
+        rows = [["Step", "Dur", "All", "Core"], ["----", "---", "---", "----"]]
+        for st in steps:
+            a_time = time_by_idx_all.get(st.idx)
+            c_time = time_by_idx_core.get(st.idx) if target_dt else None
+            rows.append([
+                st.name + (" *" if st.optional else ""),
+                fmt_dur(st.dur),
+                fmt_clock(a_time, dash) if target_dt else dash,
+                fmt_clock(c_time, dash) if target_dt else dash,
+            ])
+        rows.append(["", "", "", ""])
+        if target_dt:
+            rows += [
+                [f"Begin at (All) → {tgt_label}", "", "", fmt_clock(begin_all, dash)],
+                [f"Begin at (Core) → {tgt_label}", "", "", fmt_clock(begin_core, dash)],
+                [tgt_label, "", "", fmt_clock(target_dt, dash)],
+            ]
+        else:
+            rows += [
+                ["Total (All)", "", "", fmt_dur(total_all)],
+                ["Total (Core)", "", "", fmt_dur(total_core)],
+                [tgt_label, "", "", dash],
+            ]
 
     if args.json:
         payload = {
